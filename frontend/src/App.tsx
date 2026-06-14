@@ -1,16 +1,22 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { EcmoStreamStateMachine, ChannelMeta, StreamStats, ConnectionStatus } from './core/streamState';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import {
+  EcmoStreamStateMachine,
+  ChannelMeta,
+  StreamStats,
+  ConnectionStatus,
+} from './core/streamState';
 import { EkgScrollRenderer } from './core/ekgRenderer';
+import type { NumericRingBuffer } from './core/ringBuffer';
 
-const STREAM = new EcmoStreamStateMachine(60000);
-
+const STREAM_SINGLETON = new EcmoStreamStateMachine(60000);
 const CHANNEL_DISPLAY_ORDER = [0, 4, 1, 2, 3, 5, 10, 11, 6, 7, 8, 9];
+const VITAL_INDICES: readonly number[] = [0, 1, 2, 3, 4, 5, 10, 11];
 
 function useNowTick() {
   const [now, setNow] = useState(new Date());
   useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(id);
+    const id = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(id);
   }, []);
   return now;
 }
@@ -19,32 +25,57 @@ function useEcmoStream() {
   const [meta, setMeta] = useState<ChannelMeta[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [stats, setStats] = useState<StreamStats>({ fps: 0, totalFrames: 0, lastFrameTime: 0 });
-  const [, forceUpdate] = useState(0);
+  const [, bumpTick] = useState(0);
+
+  const pendingSamplesRef = useRef(0);
+  const rafPendingRef = useRef(false);
+
+  const scheduleRenderBump = useCallback(() => {
+    if (rafPendingRef.current) return;
+    rafPendingRef.current = true;
+    requestAnimationFrame(() => {
+      rafPendingRef.current = false;
+      const total = pendingSamplesRef.current;
+      pendingSamplesRef.current = 0;
+      if (total > 0) {
+        bumpTick((n) => (n + 1) % 1000000);
+      }
+    });
+  }, []);
 
   useEffect(() => {
-    const offMeta = STREAM.onMetadata(setMeta);
-    const offStatus = STREAM.onStatus(setStatus);
-    const offStats = STREAM.onStats(setStats);
-    const offData = STREAM.onData(() => forceUpdate(n => (n + 1) % 1000000));
-    STREAM.start();
+    const offMeta = STREAM_SINGLETON.onMetadata((m) => {
+      setMeta(m);
+    });
+    const offStatus = STREAM_SINGLETON.onStatus((s) => {
+      setStatus(s);
+    });
+    const offStats = STREAM_SINGLETON.onStats((st) => {
+      setStats({ ...st });
+    });
+    const offData = STREAM_SINGLETON.onData((newSamples: number) => {
+      pendingSamplesRef.current += newSamples;
+      scheduleRenderBump();
+    });
+    STREAM_SINGLETON.start();
     return () => {
       offMeta();
       offStatus();
       offStats();
       offData();
-      STREAM.stop();
+      STREAM_SINGLETON.stop();
     };
-  }, []);
+  }, [scheduleRenderBump]);
 
-  return { meta, status, stats, stream: STREAM };
+  return { meta, status, stats, stream: STREAM_SINGLETON };
 }
 
 function StatusPill({ status }: { status: ConnectionStatus }) {
-  const mapping = {
-    connected: { cls: '', label: '数据已连接', dot: true },
-    connecting: { cls: 'connecting', label: '正在连接...', dot: true },
-    disconnected: { cls: 'error', label: '连接已断开', dot: false },
-    error: { cls: 'error', label: '连接错误', dot: false },
+  const mapping: Record<ConnectionStatus, { cls: string; label: string }> = {
+    connected: { cls: '', label: '数据已连接' },
+    connecting: { cls: 'connecting', label: '正在连接...' },
+    disconnected: { cls: 'error', label: '连接已断开' },
+    error: { cls: 'error', label: '连接错误' },
   };
   const m = mapping[status];
   return (
@@ -55,10 +86,17 @@ function StatusPill({ status }: { status: ConnectionStatus }) {
   );
 }
 
-function VitalCard({
-  meta, value,
-}: { meta: ChannelMeta; value: number }) {
-  const displayVal = value.toFixed(meta.max > 100 ? 0 : meta.max > 10 ? 1 : 2);
+interface VitalCardProps {
+  meta: ChannelMeta;
+  stream: EcmoStreamStateMachine;
+  tick: number;
+}
+
+const VitalCard = React.memo(function VitalCard({ meta, stream, tick }: VitalCardProps) {
+  void tick;
+  const value = stream.getLatestValue(meta.index);
+  const decimals = meta.max > 100 ? 0 : meta.max > 10 ? 1 : 2;
+  const displayVal = value.toFixed(decimals);
   return (
     <div className="vital-card">
       <div className="vital-dot" style={{ background: meta.color }} />
@@ -69,19 +107,20 @@ function VitalCard({
       <div className="vital-unit">{meta.unit}</div>
     </div>
   );
-}
+});
 
 interface WaveformCellProps {
   meta: ChannelMeta;
   stream: EcmoStreamStateMachine;
-  value: number;
-  onReady: (index: number) => void;
+  tick: number;
 }
 
-function WaveformCell({ meta, stream, value, onReady }: WaveformCellProps) {
+const WaveformCell = React.memo(function WaveformCell({ meta, stream, tick }: WaveformCellProps) {
+  void tick;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<EkgScrollRenderer | null>(null);
-  const lastPushedRef = useRef(0);
+  const lastRenderedSizeRef = useRef(0);
+  const valueRef = useRef<HTMLSpanElement>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -111,9 +150,9 @@ function WaveformCell({ meta, stream, value, onReady }: WaveformCellProps) {
     };
     window.addEventListener('resize', onResize);
     const resizeObs = new ResizeObserver(onResize);
-    resizeObs.observe(canvas.parentElement!);
-
-    onReady(meta.index);
+    if (canvas.parentElement) {
+      resizeObs.observe(canvas.parentElement);
+    }
 
     return () => {
       window.removeEventListener('resize', onResize);
@@ -121,23 +160,29 @@ function WaveformCell({ meta, stream, value, onReady }: WaveformCellProps) {
       renderer.stop();
       renderer.detach();
     };
-  }, [meta.index, meta.color, meta.min, meta.max, onReady]);
+  }, [meta.index, meta.color, meta.min, meta.max]);
 
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer) return;
-    const buf = stream.getChannelBuffer(meta.index);
+    const buf: NumericRingBuffer | null = stream.getChannelBuffer(meta.index);
     if (!buf) return;
 
-    const bufSize = buf.size();
-    const newSamples = Math.max(0, bufSize - lastPushedRef.current);
+    const size = buf.size();
+    const newSamples = size - lastRenderedSizeRef.current;
     if (newSamples > 0) {
       renderer.pushBatchFromBuffer(buf, newSamples);
-      lastPushedRef.current = bufSize;
+      lastRenderedSizeRef.current = size;
+    } else if (newSamples < 0) {
+      lastRenderedSizeRef.current = size;
+    }
+
+    const decimals = meta.max > 100 ? 0 : meta.max > 10 ? 1 : 2;
+    const latest = stream.getLatestValue(meta.index);
+    if (valueRef.current) {
+      valueRef.current.textContent = latest.toFixed(decimals);
     }
   });
-
-  const displayVal = value.toFixed(meta.max > 100 ? 0 : meta.max > 10 ? 1 : 2);
 
   return (
     <div className="waveform-cell">
@@ -147,7 +192,7 @@ function WaveformCell({ meta, stream, value, onReady }: WaveformCellProps) {
           <span className="waveform-name">{meta.name}</span>
         </div>
         <div className="waveform-readout">
-          <span className="readout-value" style={{ color: meta.color }}>{displayVal}</span>
+          <span className="readout-value" ref={valueRef} style={{ color: meta.color }}>--</span>
           <span className="readout-unit">{meta.unit}</span>
         </div>
       </div>
@@ -156,42 +201,75 @@ function WaveformCell({ meta, stream, value, onReady }: WaveformCellProps) {
       </div>
     </div>
   );
-}
+});
 
 export default function App() {
   const { meta, status, stats, stream } = useEcmoStream();
   const now = useNowTick();
-  const readyChannelsRef = useRef<Set<number>>(new Set());
-  const [, forceReady] = useState(0);
 
-  const handleCellReady = useCallback((index: number) => {
-    readyChannelsRef.current.add(index);
-    forceReady(readyChannelsRef.current.size);
-  }, []);
+  const orderedChannels = useMemo(() => {
+    if (!meta.length) return [] as ChannelMeta[];
+    const arr: ChannelMeta[] = [];
+    for (let i = 0; i < CHANNEL_DISPLAY_ORDER.length; i++) {
+      const m = meta.find((x) => x.index === CHANNEL_DISPLAY_ORDER[i]);
+      if (m) arr.push(m);
+    }
+    return arr;
+  }, [meta]);
 
-  const orderedChannels = CHANNEL_DISPLAY_ORDER
-    .map(i => meta.find(m => m.index === i))
-    .filter(Boolean) as ChannelMeta[];
+  const vitals = useMemo(() => {
+    if (!meta.length) return [] as ChannelMeta[];
+    const arr: ChannelMeta[] = [];
+    for (let i = 0; i < VITAL_INDICES.length; i++) {
+      const m = meta.find((x) => x.index === VITAL_INDICES[i]);
+      if (m) arr.push(m);
+    }
+    return arr;
+  }, [meta]);
 
-  const vitalIndices = [0, 1, 2, 3, 4, 5, 10, 11];
-  const vitals = vitalIndices
-    .map(i => meta.find(m => m.index === i))
-    .filter(Boolean) as ChannelMeta[];
+  const bloodGasChannels = useMemo(() => {
+    if (!meta.length) return [] as ChannelMeta[];
+    return meta.filter((m) => VITAL_INDICES.indexOf(m.index) < 0);
+  }, [meta]);
 
-  const timeStr = now.toLocaleTimeString('zh-CN', { hour12: false });
-  const dateStr = now.toLocaleDateString('zh-CN', {
-    year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short',
-  });
+  const timeStr = useMemo(
+    () => now.toLocaleTimeString('zh-CN', { hour12: false }),
+    [now],
+  );
+  const dateStr = useMemo(
+    () =>
+      now.toLocaleDateString('zh-CN', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        weekday: 'short',
+      }),
+    [now],
+  );
 
-  const latencies: { level: 'info' | 'warning' | 'critical'; msg: string }[] = [];
-  latencies.push({ level: 'info', msg: `采样率: ${stream.getStatus() === 'connected' ? '500 Hz' : '--'} Hz` });
-  latencies.push({ level: 'info', msg: `数据吞吐: ${stats.fps.toLocaleString()} 帧/秒` });
-  if (status === 'connected' && stats.fps < 450) {
-    latencies.push({ level: 'warning', msg: `吞吐偏低 (${stats.fps}/500)` });
-  }
-  if (status !== 'connected') {
-    latencies.push({ level: 'critical', msg: '信号丢失 - 请检查设备连接' });
-  }
+  const statusNum =
+    status === 'connected' ? 3 : status === 'connecting' ? 2 : status === 'disconnected' ? 0 : 1;
+  const renderTick = statusNum * 1000000000 + stats.fps * 100000 + (stats.totalFrames % 100000);
+
+  const latencyItems = useMemo(() => {
+    const items: { level: 'info' | 'warning' | 'critical'; msg: string }[] = [];
+    const connected = status === 'connected';
+    items.push({
+      level: 'info',
+      msg: `采样率: ${connected ? '500 Hz' : '--'} Hz`,
+    });
+    items.push({
+      level: 'info',
+      msg: `数据吞吐: ${stats.fps.toLocaleString()} 帧/秒`,
+    });
+    if (connected && stats.fps > 0 && stats.fps < 450) {
+      items.push({ level: 'warning', msg: `吞吐偏低 (${stats.fps}/500)` });
+    }
+    if (!connected) {
+      items.push({ level: 'critical', msg: '信号丢失 - 请检查设备连接' });
+    }
+    return items;
+  }, [status, stats.fps]);
 
   return (
     <div className="app-root">
@@ -233,8 +311,8 @@ export default function App() {
               <h3>关键参数</h3>
               <span className="title-icon">♥</span>
             </div>
-            {vitals.map(m => (
-              <VitalCard key={m.index} meta={m} value={stream.getLatestValue(m.index)} />
+            {vitals.map((m) => (
+              <VitalCard key={m.index} meta={m} stream={stream} tick={renderTick} />
             ))}
           </div>
           <div className="vitals-panel">
@@ -242,28 +320,22 @@ export default function App() {
               <h3>血气指标</h3>
               <span className="title-icon">⚡</span>
             </div>
-            {meta.filter(m => !vitalIndices.includes(m.index)).map(m => (
-              <VitalCard key={m.index} meta={m} value={stream.getLatestValue(m.index)} />
+            {bloodGasChannels.map((m) => (
+              <VitalCard key={m.index} meta={m} stream={stream} tick={renderTick} />
             ))}
           </div>
         </aside>
 
         <section className="waveform-area">
           <div className="waveform-grid">
-            {orderedChannels.map(m => (
-              <WaveformCell
-                key={m.index}
-                meta={m}
-                stream={stream}
-                value={stream.getLatestValue(m.index)}
-                onReady={handleCellReady}
-              />
+            {orderedChannels.map((m) => (
+              <WaveformCell key={m.index} meta={m} stream={stream} tick={renderTick} />
             ))}
           </div>
         </section>
 
         <footer className="bottom-alerts">
-          {latencies.map((a, i) => (
+          {latencyItems.map((a, i) => (
             <div key={i} className={`alert-item ${a.level}`}>
               {a.level === 'critical' && '● '}
               {a.level === 'warning' && '⚠ '}

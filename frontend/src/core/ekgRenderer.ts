@@ -22,10 +22,19 @@ const DEFAULT_CONFIG = {
   paddingBottom: 4,
   showGrid: true,
   gridColor: 'rgba(77, 150, 255, 0.12)',
+  gridColorMajor: 'rgba(77, 150, 255, 0.20)',
   bgColor: 'transparent',
   fadeSpeed: 0.12,
   glowIntensity: 12,
 };
+
+function parseRgbColor(color: string): [number, number, number] {
+  const m = color.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+  if (m) {
+    return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+  }
+  return [255, 255, 255];
+}
 
 export class EkgScrollRenderer {
   private onscreenCtx: CanvasRenderingContext2D | null = null;
@@ -36,15 +45,36 @@ export class EkgScrollRenderer {
   private dpr = 1;
   private scrollX = 0;
   private lastScrollX = 0;
-  private config: Required<RendererConfig>;
+  private config: Required<RendererConfig> & { gridColorMajor: string };
   private running = false;
   private rafId: number | null = null;
   private lastFrameTime = 0;
   private writeHeadSmoothY = 0;
   private initialized = false;
 
+  private cacheHeadGradColorA = 'rgba(0, 255, 136, 0.6)';
+  private cacheHeadGradColorB = 'rgb(0, 255, 136)';
+  private cachedHeadGrad: CanvasGradient | null = null;
+  private cachedHeadGradXStart = -9999;
+  private cachedHeadGradXEnd = -9999;
+  private cachedHeadGradH = -1;
+
   constructor(config: RendererConfig) {
-    this.config = { ...DEFAULT_CONFIG, ...config } as Required<RendererConfig>;
+    this.config = { ...DEFAULT_CONFIG, ...config } as Required<RendererConfig> & { gridColorMajor: string };
+    if (!this.config.gridColorMajor) {
+      this.config.gridColorMajor = DEFAULT_CONFIG.gridColorMajor;
+    }
+    this.rebuildColorCaches(this.config.color);
+  }
+
+  private rebuildColorCaches(color: string) {
+    const rgb = parseRgbColor(color);
+    this.cacheHeadGradColorA = `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, 0.6)`;
+    this.cacheHeadGradColorB = color;
+    this.cachedHeadGrad = null;
+    this.cachedHeadGradXStart = -9999;
+    this.cachedHeadGradXEnd = -9999;
+    this.cachedHeadGradH = -1;
   }
 
   attach(canvas: HTMLCanvasElement) {
@@ -114,6 +144,7 @@ export class EkgScrollRenderer {
       this.offscreenCtx.imageSmoothingEnabled = true;
     }
 
+    this.cachedHeadGrad = null;
     this.clearAll();
   }
 
@@ -182,24 +213,28 @@ export class EkgScrollRenderer {
     const eraseX = this.scrollX;
     const eraseWidth = Math.max(2, Math.ceil(scrollDelta + 4));
 
-    this.offscreenCtx.globalCompositeOperation = 'destination-out';
-    this.offscreenCtx.fillStyle = 'rgba(0, 0, 0, 1)';
-    this.offscreenCtx.fillRect(eraseX, 0, eraseWidth, h);
-    this.offscreenCtx.globalCompositeOperation = 'source-over';
+    const off = this.offscreenCtx;
+
+    off.globalCompositeOperation = 'destination-out';
+    off.fillStyle = 'rgba(0, 0, 0, 1)';
+    off.fillRect(eraseX, 0, eraseWidth, h);
+    off.globalCompositeOperation = 'source-over';
 
     if (this.config.showGrid) {
-      this.drawScrollingGrid(this.offscreenCtx, eraseX, eraseWidth, h);
+      this.drawScrollingGrid(off, eraseX, eraseWidth, h);
     }
 
-    this.drawHeadMarker(this.offscreenCtx, eraseX, h);
+    this.drawHeadMarker(off, eraseX, h);
 
     this.onscreenCtx.clearRect(0, 0, w, h);
     this.drawFromOffscreen(this.onscreenCtx);
   }
 
   private drawScrollingGrid(ctx: CanvasRenderingContext2D, eraseX: number, eraseWidth: number, h: number) {
-    ctx.save();
-    ctx.strokeStyle = this.config.gridColor;
+    const gridColor = this.config.gridColor;
+    const gridColorMajor = this.config.gridColorMajor;
+
+    ctx.strokeStyle = gridColor;
     ctx.lineWidth = 1;
 
     const startX = Math.floor(eraseX / 20) * 20;
@@ -213,26 +248,32 @@ export class EkgScrollRenderer {
     }
 
     const majorH = h / 4;
+    ctx.strokeStyle = gridColorMajor;
+    ctx.lineWidth = 1;
     for (let i = 1; i < 4; i++) {
       const y = Math.floor(i * majorH) + 0.5;
-      ctx.strokeStyle = this.config.gridColor.replace(/0\.\d+/, '0.2');
-      ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(eraseX, y);
       ctx.lineTo(eraseX + eraseWidth + 4, y);
       ctx.stroke();
     }
-
-    ctx.restore();
   }
 
   private drawHeadMarker(ctx: CanvasRenderingContext2D, x: number, h: number) {
-    ctx.save();
+    const x0 = x - 30;
+    const x1 = x + 6;
 
-    const grad = ctx.createLinearGradient(x - 30, 0, x + 6, 0);
-    grad.addColorStop(0, 'rgba(255, 255, 255, 0)');
-    grad.addColorStop(0.85, this.config.color.replace('rgb', 'rgba').replace(')', ', 0.6)'));
-    grad.addColorStop(1, this.config.color);
+    let grad = this.cachedHeadGrad;
+    if (!grad || this.cachedHeadGradXStart !== x0 || this.cachedHeadGradXEnd !== x1 || this.cachedHeadGradH !== h) {
+      grad = ctx.createLinearGradient(x0, 0, x1, 0);
+      grad.addColorStop(0, 'rgba(255, 255, 255, 0)');
+      grad.addColorStop(0.85, this.cacheHeadGradColorA);
+      grad.addColorStop(1, this.cacheHeadGradColorB);
+      this.cachedHeadGrad = grad;
+      this.cachedHeadGradXStart = x0;
+      this.cachedHeadGradXEnd = x1;
+      this.cachedHeadGradH = h;
+    }
 
     ctx.strokeStyle = grad;
     ctx.lineWidth = 1.5;
@@ -240,8 +281,6 @@ export class EkgScrollRenderer {
     ctx.moveTo(x + 1, 0);
     ctx.lineTo(x + 1, h);
     ctx.stroke();
-
-    ctx.restore();
   }
 
   private drawFromOffscreen(ctx: CanvasRenderingContext2D) {
@@ -291,11 +330,11 @@ export class EkgScrollRenderer {
     const smoothY = prevY + (y - prevY) * 0.7;
     this.writeHeadSmoothY = smoothY;
 
-    this.drawSegment(this.offscreenCtx, prevX, prevY, writeX, smoothY, y);
+    this.drawSegmentNoSave(this.offscreenCtx, prevX, prevY, writeX, smoothY);
 
     if (writeX < prevX) {
-      this.drawSegment(this.offscreenCtx, this.width - 1, prevY, this.width - 1, prevY, prevY);
-      this.drawSegment(this.offscreenCtx, 0, smoothY, 0, y, y);
+      this.drawSegmentNoSave(this.offscreenCtx, this.width - 1, prevY, this.width - 1, prevY);
+      this.drawSegmentNoSave(this.offscreenCtx, 0, smoothY, 0, y);
     }
   }
 
@@ -316,43 +355,50 @@ export class EkgScrollRenderer {
 
     let prevX = (this.scrollX + 0.5) % this.width;
     let prevY = this.writeHeadSmoothY || this.valueToY(buffer.get(Math.max(0, startIdx - 1)), h, padTop, padBot, invRange);
-    let startX = prevX;
+    const startX = prevX;
 
-    this.offscreenCtx.save();
-    this.offscreenCtx.lineJoin = 'round';
-    this.offscreenCtx.lineCap = 'round';
-    this.offscreenCtx.lineWidth = this.config.lineWidth;
+    const ctx = this.offscreenCtx;
+
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = this.config.lineWidth;
 
     if (this.config.glowIntensity > 0) {
-      this.offscreenCtx.shadowColor = this.config.color;
-      this.offscreenCtx.shadowBlur = this.config.glowIntensity;
+      ctx.shadowColor = this.config.color;
+      ctx.shadowBlur = this.config.glowIntensity;
+    } else {
+      ctx.shadowBlur = 0;
     }
 
-    this.offscreenCtx.strokeStyle = this.config.color;
-    this.offscreenCtx.beginPath();
-    this.offscreenCtx.moveTo(prevX, prevY);
+    ctx.strokeStyle = this.config.color;
+    ctx.beginPath();
+    ctx.moveTo(prevX, prevY);
+
+    const w = this.width;
+    const threshold = w * 0.5;
 
     for (let i = startIdx; i < size; i++) {
       const value = buffer.get(i);
       const y = this.valueToY(value, h, padTop, padBot, invRange);
       prevY = prevY + (y - prevY) * 0.7;
 
-      const advanceX = (this.width * (i - startIdx + 1)) / sampleCount;
-      let nextX = (startX + advanceX) % this.width;
+      const advanceX = (w * (i - startIdx + 1)) / sampleCount;
+      const nextX = (startX + advanceX) % w;
 
-      if (nextX < prevX || (nextX - prevX) > this.width * 0.5) {
-        this.offscreenCtx.lineTo(this.width - 1, prevY);
-        this.offscreenCtx.stroke();
-        this.offscreenCtx.beginPath();
-        this.offscreenCtx.moveTo(0, prevY);
+      if (nextX < prevX || (nextX - prevX) > threshold) {
+        ctx.lineTo(w - 1, prevY);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(0, prevY);
       }
 
-      this.offscreenCtx.lineTo(nextX, prevY);
+      ctx.lineTo(nextX, prevY);
       prevX = nextX;
     }
 
-    this.offscreenCtx.stroke();
-    this.offscreenCtx.restore();
+    ctx.stroke();
+
+    ctx.shadowBlur = 0;
 
     this.writeHeadSmoothY = prevY;
   }
@@ -363,16 +409,14 @@ export class EkgScrollRenderer {
     return padTop + (h - padTop - padBot) * (1 - normalized);
   }
 
-  private drawSegment(
+  private drawSegmentNoSave(
     ctx: CanvasRenderingContext2D,
     x1: number, y1: number,
     x2: number, y2: number,
-    targetY: number
   ) {
-    const dy = Math.abs(y2 - targetY);
-    if (dy < 0.5) return;
+    const dy = Math.abs(y2 - y1);
+    if (dy < 0.5 && Math.abs(x2 - x1) < 1) return;
 
-    ctx.save();
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.lineWidth = this.config.lineWidth;
@@ -380,6 +424,8 @@ export class EkgScrollRenderer {
     if (this.config.glowIntensity > 0) {
       ctx.shadowColor = this.config.color;
       ctx.shadowBlur = this.config.glowIntensity;
+    } else {
+      ctx.shadowBlur = 0;
     }
 
     ctx.strokeStyle = this.config.color;
@@ -388,6 +434,6 @@ export class EkgScrollRenderer {
     ctx.lineTo(x2, y2);
     ctx.stroke();
 
-    ctx.restore();
+    ctx.shadowBlur = 0;
   }
 }

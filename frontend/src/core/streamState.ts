@@ -1,4 +1,4 @@
-import { EcmoWsClient, ChannelMeta, DataChunk, ConnectionStatus } from './wsClient';
+import { EcmoWsClient, ChannelMeta, StaticChunkInfo, ConnectionStatus } from './wsClient';
 import { NumericRingBuffer } from './ringBuffer';
 
 export interface StreamStats {
@@ -11,15 +11,15 @@ export type { ConnectionStatus, ChannelMeta };
 
 export class EcmoStreamStateMachine {
   private ws: EcmoWsClient;
-  private channelMeta: ChannelMeta[] = [];
+  private channelMeta: ChannelMeta[] | null = null;
   private buffers: NumericRingBuffer[] = [];
-  private latestValues: Float32Array = new Float32Array(12);
-  private minValues: Float32Array = new Float32Array(12);
-  private maxValues: Float32Array = new Float32Array(12);
+  private latestValues: Float32Array = new Float32Array(16);
+  private minValues: Float32Array = new Float32Array(16);
+  private maxValues: Float32Array = new Float32Array(16);
   private initialized = false;
 
   private metaListeners = new Set<(meta: ChannelMeta[]) => void>();
-  private dataListeners = new Set<() => void>();
+  private dataListeners = new Set<(newSamples: number) => void>();
   private statusListeners = new Set<(s: ConnectionStatus) => void>();
   private statsListeners = new Set<(stats: StreamStats) => void>();
 
@@ -40,13 +40,18 @@ export class EcmoStreamStateMachine {
     this.ws.onMetadata((meta) => {
       this.channelMeta = meta;
       const chCount = meta.length;
-      this.buffers = new Array(chCount);
-      for (let i = 0; i < chCount; i++) {
-        this.buffers[i] = new NumericRingBuffer(bufferSize);
+      if (this.buffers.length < chCount) {
+        const newBufs: NumericRingBuffer[] = new Array(chCount);
+        for (let i = 0; i < chCount; i++) {
+          newBufs[i] = i < this.buffers.length ? this.buffers[i] : new NumericRingBuffer(bufferSize);
+        }
+        this.buffers = newBufs;
       }
-      this.latestValues = new Float32Array(chCount);
-      this.minValues = new Float32Array(chCount);
-      this.maxValues = new Float32Array(chCount);
+      if (this.latestValues.length < chCount) {
+        this.latestValues = new Float32Array(Math.max(16, chCount));
+        this.minValues = new Float32Array(Math.max(16, chCount));
+        this.maxValues = new Float32Array(Math.max(16, chCount));
+      }
       for (let i = 0; i < chCount; i++) {
         this.minValues[i] = meta[i].min;
         this.maxValues[i] = meta[i].max;
@@ -57,8 +62,8 @@ export class EcmoStreamStateMachine {
       });
     });
 
-    this.ws.onDataChunk((chunk) => {
-      this.processChunk(chunk);
+    this.ws.onRawChunk((_info: StaticChunkInfo) => {
+      this.processChunkRaw(_info.frameCount);
     });
 
     this.ws.onStatus((s) => {
@@ -67,7 +72,7 @@ export class EcmoStreamStateMachine {
       });
     });
 
-    this.ws.onStats(({ fps, total }) => {
+    this.ws.onStats((fps: number, total: number) => {
       this.stats.fps = fps;
       this.stats.totalFrames = total;
       this.stats.lastFrameTime = performance.now();
@@ -77,28 +82,17 @@ export class EcmoStreamStateMachine {
     });
   }
 
-  private processChunk(chunk: DataChunk) {
+  private processChunkRaw(newSamples: number) {
     if (!this.initialized) return;
-
-    const { frameCount, channelCount, samples } = chunk;
-
-    for (let c = 0; c < channelCount && c < this.buffers.length; c++) {
-      const buf = this.buffers[c];
-      const chData = samples[c];
-      if (chData.length === frameCount) {
-        buf.pushAll(chData);
-      } else {
-        for (let f = 0; f < frameCount && f < chData.length; f++) {
-          buf.push(chData[f]);
-        }
-      }
-      if (frameCount > 0) {
-        this.latestValues[c] = chData[frameCount - 1];
-      }
+    const channelCount = this.ws.getChannelCount();
+    const latest = this.ws.getLatestScratch();
+    const n = Math.min(channelCount, this.buffers.length);
+    for (let c = 0; c < n; c++) {
+      const lastVal = this.ws.writeChannelToRing(c, this.buffers[c]);
+      this.latestValues[c] = lastVal !== 0 ? lastVal : latest[c];
     }
-
     this.dataListeners.forEach(fn => {
-      try { fn(); } catch (e) { console.error(e); }
+      try { fn(newSamples); } catch (e) { console.error(e); }
     });
   }
 
@@ -119,11 +113,11 @@ export class EcmoStreamStateMachine {
   }
 
   getChannelCount(): number {
-    return this.channelMeta.length;
+    return this.channelMeta ? this.channelMeta.length : 0;
   }
 
-  getChannelMeta(): ChannelMeta[] {
-    return this.channelMeta.slice();
+  getChannelMeta(): ChannelMeta[] | null {
+    return this.channelMeta;
   }
 
   getChannelBuffer(index: number): NumericRingBuffer | null {
@@ -135,7 +129,7 @@ export class EcmoStreamStateMachine {
   }
 
   getLatestValues(): Float32Array {
-    return new Float32Array(this.latestValues);
+    return this.latestValues;
   }
 
   getChannelMin(index: number): number {
@@ -147,18 +141,18 @@ export class EcmoStreamStateMachine {
   }
 
   getStats(): StreamStats {
-    return { ...this.stats };
+    return this.stats;
   }
 
   onMetadata(fn: (meta: ChannelMeta[]) => void) {
     this.metaListeners.add(fn);
-    if (this.channelMeta.length > 0) {
+    if (this.channelMeta) {
       try { fn(this.channelMeta); } catch (e) { console.error(e); }
     }
     return () => this.metaListeners.delete(fn);
   }
 
-  onData(fn: () => void) {
+  onData(fn: (newSamples: number) => void) {
     this.dataListeners.add(fn);
     return () => this.dataListeners.delete(fn);
   }

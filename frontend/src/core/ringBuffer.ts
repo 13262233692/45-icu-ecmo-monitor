@@ -78,32 +78,6 @@ export class RingBuffer<T> {
     const actualIndex = (this.readIndex + index) % this.capacity;
     return this.buffer[actualIndex];
   }
-
-  toArray(): T[] {
-    const result: T[] = [];
-    for (let i = 0; i < this.count; i++) {
-      const idx = (this.readIndex + i) % this.capacity;
-      const v = this.buffer[idx];
-      if (v !== undefined) result.push(v);
-    }
-    return result;
-  }
-
-  forEach(callback: (value: T, index: number) => void): void {
-    for (let i = 0; i < this.count; i++) {
-      const idx = (this.readIndex + i) % this.capacity;
-      const v = this.buffer[idx];
-      if (v !== undefined) callback(v, i);
-    }
-  }
-
-  *[Symbol.iterator](): Generator<T> {
-    for (let i = 0; i < this.count; i++) {
-      const idx = (this.readIndex + i) % this.capacity;
-      const v = this.buffer[idx];
-      if (v !== undefined) yield v;
-    }
-  }
 }
 
 export class NumericRingBuffer {
@@ -123,6 +97,20 @@ export class NumericRingBuffer {
 
   size(): number {
     return this.count;
+  }
+
+  getWriteIndex(): number {
+    return this.writeIndex;
+  }
+
+  forceAdvanceWrite(newWriteIndex: number, addedCount: number): void {
+    this.writeIndex = newWriteIndex;
+    const nc = this.count + addedCount;
+    this.count = nc > this.capacity ? this.capacity : nc;
+  }
+
+  getRawBuffer(): Float32Array {
+    return this.buffer;
   }
 
   clear() {
@@ -146,36 +134,103 @@ export class NumericRingBuffer {
     }
   }
 
+  pushFromArrayLike(src: ArrayLike<number>, srcOffset: number, length: number): void {
+    const cap = this.capacity;
+    let w = this.writeIndex;
+    for (let i = 0; i < length; i++) {
+      this.buffer[w] = src[srcOffset + i];
+      w = (w + 1) % cap;
+    }
+    this.writeIndex = w;
+    this.count = Math.min(this.count + length, cap);
+  }
+
+  pushFromDataView(
+    view: DataView,
+    byteOffset: number,
+    float32Count: number,
+    littleEndian: boolean = true,
+  ): number {
+    const cap = this.capacity;
+    let w = this.writeIndex;
+    let off = byteOffset;
+    for (let i = 0; i < float32Count; i++) {
+      this.buffer[w] = view.getFloat32(off, littleEndian);
+      off += 4;
+      w = (w + 1) % cap;
+    }
+    this.writeIndex = w;
+    const oldCount = this.count;
+    this.count = Math.min(oldCount + float32Count, cap);
+    return off;
+  }
+
   get(index: number): number {
     if (this.count < this.capacity) {
       return index < this.count ? this.buffer[index] : 0;
     }
-    const actualIndex = (this.writeIndex + index) % this.capacity;
-    return this.buffer[actualIndex];
+    return this.buffer[(this.writeIndex + index) % this.capacity];
   }
 
   getLast(): number {
     if (this.count === 0) return 0;
-    const idx = (this.writeIndex - 1 + this.capacity) % this.capacity;
-    return this.buffer[idx];
+    return this.buffer[(this.writeIndex - 1 + this.capacity) % this.capacity];
   }
 
-  toArray(): Float32Array {
-    const result = new Float32Array(this.count);
+  copyContiguousInto(target: Float32Array, targetOffset: number, length: number): number {
+    const n = Math.min(length, this.count);
+    if (n <= 0) return 0;
     if (this.count < this.capacity) {
-      result.set(this.buffer.subarray(0, this.count));
+      for (let i = 0; i < n; i++) {
+        target[targetOffset + i] = this.buffer[i];
+      }
     } else {
-      const tailLen = this.capacity - this.writeIndex;
-      result.set(this.buffer.subarray(this.writeIndex, this.capacity), 0);
-      if (this.writeIndex > 0) {
-        result.set(this.buffer.subarray(0, this.writeIndex), tailLen);
+      const start = this.writeIndex;
+      const tailLen = this.capacity - start;
+      if (n <= tailLen) {
+        for (let i = 0; i < n; i++) {
+          target[targetOffset + i] = this.buffer[start + i];
+        }
+      } else {
+        for (let i = 0; i < tailLen; i++) {
+          target[targetOffset + i] = this.buffer[start + i];
+        }
+        const remain = n - tailLen;
+        for (let i = 0; i < remain; i++) {
+          target[targetOffset + tailLen + i] = this.buffer[i];
+        }
       }
     }
-    return result;
+    return n;
   }
 
-  copyToContiguous(): Float32Array {
-    return this.toArray();
+  copyLatestContiguousInto(target: Float32Array, length: number): number {
+    const n = Math.min(length, this.count);
+    if (n <= 0) return 0;
+    const startAbs = this.count < this.capacity
+      ? this.count - n
+      : (this.writeIndex - n + this.capacity) % this.capacity;
+    if (this.count < this.capacity) {
+      for (let i = 0; i < n; i++) {
+        target[i] = this.buffer[startAbs + i];
+      }
+    } else {
+      const tailLen = this.capacity - startAbs;
+      if (n <= tailLen) {
+        for (let i = 0; i < n; i++) {
+          target[i] = this.buffer[startAbs + i];
+        }
+      } else {
+        for (let i = 0; i < tailLen; i++) {
+          target[i] = this.buffer[startAbs + i];
+        }
+        const remain = n - tailLen;
+        for (let i = 0; i < remain; i++) {
+          target[tailLen + i] = this.buffer[i];
+        }
+      }
+    }
+    return n;
   }
 
   min(): number {
