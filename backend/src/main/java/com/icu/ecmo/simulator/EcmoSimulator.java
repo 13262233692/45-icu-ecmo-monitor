@@ -3,6 +3,7 @@ package com.icu.ecmo.simulator;
 import com.icu.ecmo.config.GatewayConfig;
 import com.icu.ecmo.protocol.EcmoBinaryFrameEncoder;
 import com.icu.ecmo.protocol.EcmoSensorFrame;
+import com.icu.ecmo.safety.SafetyClampService;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
@@ -14,19 +15,40 @@ import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class EcmoSimulator {
 
     private static final Logger logger = LoggerFactory.getLogger(EcmoSimulator.class);
 
     private final GatewayConfig config;
+    private final SafetyClampService clampService;
     private EventLoopGroup group;
     private Channel channel;
     private volatile boolean running = false;
     private final AtomicInteger sequence = new AtomicInteger(0);
 
-    public EcmoSimulator(GatewayConfig config) {
+    private final AtomicReference<Double> pumpRpmMultiplier = new AtomicReference<>(1.0);
+    private final AtomicReference<Double> pressureMultiplier = new AtomicReference<>(1.0);
+
+    public EcmoSimulator(GatewayConfig config, SafetyClampService clampService) {
         this.config = config;
+        this.clampService = clampService;
+        setupClampListener();
+    }
+
+    private void setupClampListener() {
+        clampService.onClamp(reason -> {
+            logger.warn("[Simulator] 收到安全钳制指令，开始降低血泵转速...");
+            pumpRpmMultiplier.set(0.2);
+            pressureMultiplier.set(0.8);
+        });
+
+        clampService.onRelease(() -> {
+            logger.info("[Simulator] 安全钳制解除，血泵恢复正常");
+            pumpRpmMultiplier.set(1.0);
+            pressureMultiplier.set(1.0);
+        });
     }
 
     public void start() throws InterruptedException {
@@ -110,11 +132,19 @@ public class EcmoSimulator {
                         for (int i = 0; i < EcmoSensorFrame.CHANNEL_COUNT; i++) {
                             phases[i] = t * frequencies[i] * 2 * Math.PI;
                             double noise = (rng.nextDouble() - 0.5) * amplitudes[i] * 0.1;
-                            samples[i] = (float) (baseValues[i]
+                            double value = baseValues[i]
                                     + Math.sin(phases[i]) * amplitudes[i]
                                     + Math.sin(phases[i] * 2.3 + 0.5) * amplitudes[i] * 0.3
                                     + Math.sin(phases[i] * 0.47) * amplitudes[i] * 0.2
-                                    + noise);
+                                    + noise;
+
+                            if (i == 0) {
+                                value *= pumpRpmMultiplier.get();
+                            } else if (i >= 1 && i <= 3) {
+                                value *= pressureMultiplier.get();
+                            }
+
+                            samples[i] = (float) value;
                         }
 
                         EcmoSensorFrame frame = new EcmoSensorFrame(timestamp, seq, samples.clone());

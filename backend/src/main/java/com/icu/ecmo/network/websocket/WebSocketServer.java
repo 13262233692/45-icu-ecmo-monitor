@@ -4,6 +4,7 @@ import com.icu.ecmo.config.GatewayConfig;
 import com.icu.ecmo.core.DataBus;
 import com.icu.ecmo.protocol.EcmoSensorFrame;
 import com.icu.ecmo.protocol.WebSocketChunkEncoder;
+import com.icu.ecmo.safety.SafetyClampService;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -32,13 +33,15 @@ public class WebSocketServer {
 
     private final GatewayConfig config;
     private final DataBus dataBus;
+    private final SafetyClampService clampService;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
-    public WebSocketServer(GatewayConfig config) {
+    public WebSocketServer(GatewayConfig config, SafetyClampService clampService) {
         this.config = config;
         this.dataBus = DataBus.getInstance();
+        this.clampService = clampService;
     }
 
     public void start() throws InterruptedException {
@@ -59,7 +62,7 @@ public class WebSocketServer {
                                 .addLast(new HttpServerCodec())
                                 .addLast(new HttpObjectAggregator(65536))
                                 .addLast(new ChunkedWriteHandler())
-                                .addLast(new WebSocketServerHandler(config, dataBus));
+                                .addLast(new WebSocketServerHandler(config, dataBus, clampService));
                     }
                 });
 
@@ -211,12 +214,14 @@ class WebSocketServerHandler extends SimpleChannelInboundHandler<Object> {
 
     private final GatewayConfig config;
     private final DataBus dataBus;
+    private final SafetyClampService clampService;
     private WebSocketServerHandshaker handshaker;
     private ClientSession session;
 
-    public WebSocketServerHandler(GatewayConfig config, DataBus dataBus) {
+    public WebSocketServerHandler(GatewayConfig config, DataBus dataBus, SafetyClampService clampService) {
         this.config = config;
         this.dataBus = dataBus;
+        this.clampService = clampService;
     }
 
     @Override
@@ -295,15 +300,54 @@ class WebSocketServerHandler extends SimpleChannelInboundHandler<Object> {
             return;
         }
         if (frame instanceof TextWebSocketFrame) {
-            String text = ((TextWebSocketFrame) frame).text();
-            logger.debug("Received text frame: {}", text);
-            ctx.writeAndFlush(new TextWebSocketFrame("{\"ack\":true}"));
+            String text = ((TextWebSocketFrame) frame).text().trim().toUpperCase();
+            logger.info("Received control command: {}", text);
+            handleControlCommand(ctx, text);
             return;
         }
         if (frame instanceof BinaryWebSocketFrame) {
             logger.debug("Received binary frame, {} bytes", frame.content().readableBytes());
             return;
         }
+    }
+
+    private void handleControlCommand(ChannelHandlerContext ctx, String cmd) {
+        StringBuilder response = new StringBuilder();
+        response.append("{\"cmd\":\"").append(cmd).append("\",");
+
+        switch (cmd) {
+            case "CLAMP":
+            case "CLAMP_THROMBUS":
+                boolean triggered = clampService.triggerClamp(SafetyClampService.ClampReason.THROMBUS_DETECTED);
+                response.append("\"success\":").append(triggered).append(",");
+                response.append("\"state\":\"").append(clampService.getState()).append("\"");
+                logger.warn("安全钳制触发 (远程指令): success={}, state={}", triggered, clampService.getState());
+                break;
+
+            case "RELEASE":
+            case "UNCLAMP":
+                boolean released = clampService.releaseClamp();
+                response.append("\"success\":").append(released).append(",");
+                response.append("\"state\":\"").append(clampService.getState()).append("\"");
+                logger.info("安全钳制解除 (远程指令): success={}", released);
+                break;
+
+            case "STATUS":
+            case "CLAMP_STATUS":
+                response.append("\"state\":\"").append(clampService.getState()).append("\",");
+                response.append("\"clamped\":").append(clampService.isClamped()).append(",");
+                response.append("\"pumpRpm\":").append(String.format("%.2f", clampService.getCurrentPumpRpm())).append(",");
+                SafetyClampService.ClampReason reason = clampService.getLastReason();
+                response.append("\"reason\":\"").append(reason != null ? reason : "NONE").append("\"");
+                break;
+
+            default:
+                response.append("\"error\":\"UNKNOWN_COMMAND\"");
+                break;
+        }
+
+        response.append("}");
+        ctx.writeAndFlush(new TextWebSocketFrame(response.toString()));
     }
 
     private static void sendHttpResponse(ChannelHandlerContext ctx,

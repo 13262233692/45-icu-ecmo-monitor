@@ -39,6 +39,7 @@ export class EcmoWsClient {
 
   private channelMeta: ChannelMeta[] | null = null;
   private channelCount = 0;
+  private sampleRate = 500;
   private staticLatestScratch: Float32Array = new Float32Array(SCRATCH_LATEST_LEN);
 
   private metaTextDecoder: TextDecoder | null = null;
@@ -122,6 +123,10 @@ export class EcmoWsClient {
 
   getMeta(): ChannelMeta[] | null {
     return this.channelMeta;
+  }
+
+  getSampleRate(): number {
+    return this.sampleRate;
   }
 
   getLatestScratch(): Float32Array {

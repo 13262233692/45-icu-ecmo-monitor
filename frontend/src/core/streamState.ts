@@ -1,5 +1,10 @@
 import { EcmoWsClient, ChannelMeta, StaticChunkInfo, ConnectionStatus } from './wsClient';
 import { NumericRingBuffer } from './ringBuffer';
+import {
+  PanTompkinsThrombusDetector,
+  ThrombusEvent,
+  ThrombusAlertLevel,
+} from './thrombusDetector';
 
 export interface StreamStats {
   fps: number;
@@ -7,7 +12,10 @@ export interface StreamStats {
   lastFrameTime: number;
 }
 
-export type { ConnectionStatus, ChannelMeta };
+export type { ConnectionStatus, ChannelMeta, ThrombusEvent };
+export { ThrombusAlertLevel };
+
+const TMP_CHANNEL_INDEX = 3;
 
 export class EcmoStreamStateMachine {
   private ws: EcmoWsClient;
@@ -18,10 +26,15 @@ export class EcmoStreamStateMachine {
   private maxValues: Float32Array = new Float32Array(16);
   private initialized = false;
 
+  private thrombusDetector: PanTompkinsThrombusDetector | null = null;
+  private lastThrombusTick = 0;
+
   private metaListeners = new Set<(meta: ChannelMeta[]) => void>();
   private dataListeners = new Set<(newSamples: number) => void>();
   private statusListeners = new Set<(s: ConnectionStatus) => void>();
   private statsListeners = new Set<(stats: StreamStats) => void>();
+  private thrombusListeners = new Set<(ev: ThrombusEvent) => void>();
+  private clampListeners = new Set<(ev: ThrombusEvent) => void>();
 
   private stats: StreamStats = {
     fps: 0,
@@ -56,6 +69,28 @@ export class EcmoStreamStateMachine {
         this.minValues[i] = meta[i].min;
         this.maxValues[i] = meta[i].max;
       }
+
+      if (TMP_CHANNEL_INDEX < chCount) {
+        const tmpMeta = meta[TMP_CHANNEL_INDEX];
+        this.thrombusDetector = new PanTompkinsThrombusDetector({
+          sampleRate: this.ws.getSampleRate() || 500,
+          tmpMin: tmpMeta.min,
+          tmpMax: tmpMeta.max,
+          tmpRedLine: tmpMeta.max * 0.8,
+        });
+        this.thrombusDetector.onAlert((ev) => {
+          this.lastThrombusTick++;
+          this.thrombusListeners.forEach(fn => {
+            try { fn(ev); } catch (e) { console.error(e); }
+          });
+        });
+        this.thrombusDetector.onClamp((ev) => {
+          this.clampListeners.forEach(fn => {
+            try { fn(ev); } catch (e) { console.error(e); }
+          });
+        });
+      }
+
       this.initialized = true;
       this.metaListeners.forEach(fn => {
         try { fn(meta); } catch (e) { console.error(e); }
@@ -91,6 +126,14 @@ export class EcmoStreamStateMachine {
       const lastVal = this.ws.writeChannelToRing(c, this.buffers[c]);
       this.latestValues[c] = lastVal !== 0 ? lastVal : latest[c];
     }
+
+    if (this.thrombusDetector && TMP_CHANNEL_INDEX < n) {
+      const tmpBuf = this.buffers[TMP_CHANNEL_INDEX];
+      if (tmpBuf) {
+        this.thrombusDetector.pushFromRing(tmpBuf, newSamples);
+      }
+    }
+
     this.dataListeners.forEach(fn => {
       try { fn(newSamples); } catch (e) { console.error(e); }
     });
@@ -166,5 +209,37 @@ export class EcmoStreamStateMachine {
   onStats(fn: (stats: StreamStats) => void) {
     this.statsListeners.add(fn);
     return () => this.statsListeners.delete(fn);
+  }
+
+  getThrombusLevel(): ThrombusAlertLevel {
+    return this.thrombusDetector
+      ? this.thrombusDetector.getCurrentLevel()
+      : ThrombusAlertLevel.NORMAL;
+  }
+
+  getThrombusTick(): number {
+    return this.lastThrombusTick;
+  }
+
+  getThrombusDetector(): PanTompkinsThrombusDetector | null {
+    return this.thrombusDetector;
+  }
+
+  onThrombusAlert(fn: (ev: ThrombusEvent) => void) {
+    this.thrombusListeners.add(fn);
+    return () => this.thrombusListeners.delete(fn);
+  }
+
+  onThrombusClamp(fn: (ev: ThrombusEvent) => void) {
+    this.clampListeners.add(fn);
+    return () => this.clampListeners.delete(fn);
+  }
+
+  triggerThrombusTest(pressure: number): void {
+    if (this.thrombusDetector) {
+      for (let i = 0; i < 50; i++) {
+        this.thrombusDetector.pushSample(pressure);
+      }
+    }
   }
 }

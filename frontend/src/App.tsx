@@ -4,6 +4,8 @@ import {
   ChannelMeta,
   StreamStats,
   ConnectionStatus,
+  ThrombusEvent,
+  ThrombusAlertLevel,
 } from './core/streamState';
 import { EkgScrollRenderer } from './core/ekgRenderer';
 import type { NumericRingBuffer } from './core/ringBuffer';
@@ -25,6 +27,8 @@ function useEcmoStream() {
   const [meta, setMeta] = useState<ChannelMeta[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [stats, setStats] = useState<StreamStats>({ fps: 0, totalFrames: 0, lastFrameTime: 0 });
+  const [thrombusLevel, setThrombusLevel] = useState<ThrombusAlertLevel>(ThrombusAlertLevel.NORMAL);
+  const [thrombusEvent, setThrombusEvent] = useState<ThrombusEvent | null>(null);
   const [, bumpTick] = useState(0);
 
   const pendingSamplesRef = useRef(0);
@@ -57,17 +61,22 @@ function useEcmoStream() {
       pendingSamplesRef.current += newSamples;
       scheduleRenderBump();
     });
+    const offThrombus = STREAM_SINGLETON.onThrombusAlert((ev: ThrombusEvent) => {
+      setThrombusLevel(ev.level);
+      setThrombusEvent({ ...ev });
+    });
     STREAM_SINGLETON.start();
     return () => {
       offMeta();
       offStatus();
       offStats();
       offData();
+      offThrombus();
       STREAM_SINGLETON.stop();
     };
   }, [scheduleRenderBump]);
 
-  return { meta, status, stats, stream: STREAM_SINGLETON };
+  return { meta, status, stats, stream: STREAM_SINGLETON, thrombusLevel, thrombusEvent };
 }
 
 function StatusPill({ status }: { status: ConnectionStatus }) {
@@ -204,8 +213,13 @@ const WaveformCell = React.memo(function WaveformCell({ meta, stream, tick }: Wa
 });
 
 export default function App() {
-  const { meta, status, stats, stream } = useEcmoStream();
+  const { meta, status, stats, stream, thrombusLevel, thrombusEvent } = useEcmoStream();
   const now = useNowTick();
+
+  const isCritical = thrombusLevel === ThrombusAlertLevel.CRITICAL;
+  const clamped = thrombusEvent?.clamped ?? false;
+
+  const pumpStatus = clamped ? 'clamped' : isCritical ? 'clamping' : 'normal';
 
   const orderedChannels = useMemo(() => {
     if (!meta.length) return [] as ChannelMeta[];
@@ -272,7 +286,29 @@ export default function App() {
   }, [status, stats.fps]);
 
   return (
-    <div className="app-root">
+    <div className={`app-root ${isCritical ? 'critical-mode' : ''}`}>
+      {isCritical && (
+        <div className="red-alert-banner">
+          <div className="alert-pulse" />
+          <div className="alert-icon">⚠</div>
+          <div className="alert-content">
+            <div className="alert-title">恶性体外循环栓塞 · 一级红色警报</div>
+            <div className="alert-desc">
+              {thrombusEvent?.message || '检测到 TMP 异常突变，已启动安全钳制'}
+              {thrombusEvent && (
+                <>
+                  {' '}· 当前 TMP: {thrombusEvent.currentTMP.toFixed(1)} mmHg · 预测:{' '}
+                  {thrombusEvent.predictedTMP.toFixed(1)} mmHg
+                </>
+              )}
+            </div>
+          </div>
+          <div className="alert-status-badge">
+            {clamped ? '血泵已锁死' : '正在启动钳制...'}
+          </div>
+        </div>
+      )}
+
       <header className="top-bar">
         <div className="logo-area">
           <div className="logo-icon">E</div>
@@ -306,6 +342,29 @@ export default function App() {
 
       <main className="main-content">
         <aside className="left-panel">
+          <div className={`pump-status-card ${pumpStatus}`}>
+            <div className="pump-status-header">
+              <div className={`pump-status-dot ${pumpStatus}`} />
+              <span className="pump-status-label">血泵安全控制</span>
+            </div>
+            <div className="pump-status-main">
+              <span className={`pump-status-text ${pumpStatus}`}>
+                {clamped ? '安全钳制已启动' : isCritical ? '正在钳制...' : '正常运行'}
+              </span>
+            </div>
+            <div className="pump-status-detail">
+              <span>模式: VA-ECMO</span>
+              <span className="pump-status-sep">·</span>
+              <span>状态: {clamped ? 'FLOW LOCKED' : 'AUTO'}</span>
+            </div>
+            {thrombusEvent && isCritical && (
+              <div className="pump-clamp-info">
+                <div>触发: {thrombusEvent.message}</div>
+                <div>置信度: {(thrombusEvent.confidence * 100).toFixed(0)}%</div>
+              </div>
+            )}
+          </div>
+
           <div className="vitals-panel">
             <div className="panel-title">
               <h3>关键参数</h3>
